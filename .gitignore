@@ -1,0 +1,19 @@
+# Local Terraform working directory and provider plugins
+.terraform/
+.terraform.tfstate.lock.info
+
+# State files - may contain sensitive resource details, never commit
+*.tfstate
+*.tfstate.*
+
+# Real variable values for your own environment - never commit
+terraform.tfvars
+*.auto.tfvars
+
+# Plan output files
+*.tfplan
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

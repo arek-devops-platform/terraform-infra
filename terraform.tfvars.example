@@ -5,7 +5,7 @@
 # since it holds values specific to your own Azure environment.
 
 subscription_id      = "00000000-0000-0000-0000-000000000000"
-location              = "westeurope"
+location              = "polandcentral"
 resource_group_name   = "rg-app-demo-lab"
 
 # Must be globally unique across all of Azure - letters and numbers only.

@@ -14,7 +14,7 @@ acr_sku               = "Basic"
 
 aks_cluster_name      = "aks-app-demo-lab"
 aks_node_count        = 1
-aks_vm_size           = "Standard_B2s"
+aks_vm_size           = "Standard_B2s_v2"
 
 tags = {
   project     = "app-demo"

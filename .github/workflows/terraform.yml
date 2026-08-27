@@ -1,0 +1,218 @@
+name: Terraform - Azure Infrastructure
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# Minimum permissions needed: read the repo checkout, and mint the OIDC
+# token that azure/login and Terraform's azurerm provider both exchange
+# with Azure AD for a short-lived access token (no client secret anywhere).
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # Consumed directly by the Terraform azurerm provider/backend (NOT by
+  # azure/login - that action only logs in the Azure CLI, separately).
+  # ARM_CLIENT_ID is intentionally NOT set here: pull_request jobs and
+  # push/main jobs use two different identities (PLAN vs APPLY), so each
+  # job below sets its own ARM_CLIENT_ID at the job level instead, which
+  # overrides this workflow-level env for that job only.
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  # Makes Terraform's own CLI output slightly more automation-friendly.
+  TF_IN_AUTOMATION: "true"
+  # Supplies the root stage's required variables (acr_name has no default,
+  # location overrides the polandcentral default explicitly from CI).
+  # Harmless on the kubernetes stage - Terraform ignores TF_VAR_* values
+  # that don't match a declared variable in that particular stage.
+  TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+  TF_VAR_location: ${{ vars.AZURE_LOCATION }}
+
+jobs:
+  root-plan:
+    name: "Root Stage: Format, Validate, Plan (Pull Request)"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # PLAN identity: Reader + Storage Blob Data Reader only. Cannot create,
+    # modify, delete, or assign permissions to anything - genuinely
+    # read-only in Azure, not merely read-only because this job happens to
+    # call "terraform plan".
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, PLAN identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform fmt check (whole repository)
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (root stage)
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=terraform-infra.tfstate"
+
+      - name: Terraform validate (root stage)
+        run: terraform validate
+
+      # -lock=false: the PLAN identity only has Storage Blob Data Reader on
+      # the state storage account, which cannot take the blob lease that
+      # state locking requires (that needs write/lease permission). Since
+      # this identity can never write state anyway, skipping the lock here
+      # trades a tiny, harmless race (a plan run at the exact same moment
+      # as a real apply might read a mid-write state file) for a PLAN
+      # identity with zero write capability anywhere in Azure.
+      - name: Terraform plan (root stage)
+        run: terraform plan -input=false -lock=false
+
+  kubernetes-validate:
+    name: "Kubernetes Stage: Init & Validate Only (Pull Request)"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kubernetes
+    # PLAN identity - same as root-plan. This job never runs a plan or
+    # touches real Azure resources (see comment below), so Reader +
+    # Storage Blob Data Reader is already more than it strictly needs.
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, PLAN identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform init (kubernetes stage)
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=terraform-infra-kubernetes.tfstate"
+
+      # Deliberately no "terraform plan" here. This stage reads the AKS
+      # cluster via a data source, which only succeeds once the cluster
+      # actually exists. On a pull request the root stage may not have
+      # been applied yet, so a plan here could fail for a reason that has
+      # nothing to do with whether this PR's own code is correct.
+      - name: Terraform validate (kubernetes stage)
+        run: terraform validate
+
+  root-apply:
+    name: "Root Stage: Init, Validate, Plan, Apply (main)"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # APPLY identity: Contributor + Role Based Access Control Administrator
+    # + Storage Blob Data Contributor. Only reachable from main, after a PR
+    # has already been reviewed and merged - never from an unreviewed PR.
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, APPLY identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform init (root stage)
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=terraform-infra.tfstate"
+
+      - name: Terraform validate (root stage)
+        run: terraform validate
+
+      - name: Terraform plan (root stage)
+        run: terraform plan -input=false -out=tfplan
+
+      # Applies exactly the plan reviewed above, rather than re-planning
+      # implicitly - guarantees apply matches what was just validated.
+      - name: Terraform apply (root stage)
+        run: terraform apply -input=false -auto-approve tfplan
+
+  kubernetes-apply:
+    name: "Kubernetes Stage: Init, Validate, Plan, Apply (main)"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: root-apply
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kubernetes
+    # APPLY identity - same as root-apply.
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, APPLY identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform init (kubernetes stage)
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=terraform-infra-kubernetes.tfstate"
+
+      - name: Terraform validate (kubernetes stage)
+        run: terraform validate
+
+      - name: Terraform plan (kubernetes stage)
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform apply (kubernetes stage)
+        run: terraform apply -input=false -auto-approve tfplan

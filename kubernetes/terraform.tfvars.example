@@ -1,0 +1,14 @@
+# Copy this file to terraform.tfvars and fill in real values:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# terraform.tfvars is listed in .gitignore and must never be committed.
+#
+# subscription_id, resource_group_name and aks_cluster_name must match the
+# values used for the infra stage (the ../terraform.tfvars in the parent
+# directory) - this stage reads that already-created cluster back by name.
+
+subscription_id      = "00000000-0000-0000-0000-000000000000"
+resource_group_name   = "rg-app-demo-lab"
+aks_cluster_name      = "aks-app-demo-lab"
+
+namespaces            = ["dev", "prod"]

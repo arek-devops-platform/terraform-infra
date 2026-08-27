@@ -45,9 +45,9 @@ variable "aks_node_count" {
 }
 
 variable "aks_vm_size" {
-  description = "VM size for AKS nodes. Standard_B2s is a low-cost burstable size suitable for a lab, not for production workloads."
+  description = "VM size for AKS nodes. Standard_B2s_v2 is a low-cost burstable size suitable for a lab, not for production workloads."
   type        = string
-  default     = "Standard_B2s"
+  default     = "Standard_B2s_v2"
 }
 
 variable "tags" {

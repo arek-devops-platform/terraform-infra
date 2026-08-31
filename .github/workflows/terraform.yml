@@ -129,9 +129,29 @@ jobs:
       - name: Terraform validate (kubernetes stage)
         run: terraform validate
 
+  infra-approval:
+    name: "Manual Approval Gate (main)"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # This job's sole purpose is to require a human approval before either
+    # apply job below can start. The "infra-prod" GitHub Environment (with
+    # its required-reviewer protection rule) is what actually enforces the
+    # pause - this job does nothing else: no Azure login, no Terraform, not
+    # even an id-token. It cannot touch infrastructure even in principle.
+    environment: infra-prod
+    # Overrides the workflow-level permissions block below: this job gets
+    # no id-token at all, so it cannot mint an OIDC token even by mistake -
+    # there is nothing here for a compromised step to authenticate with.
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm approval
+        run: echo "infra-prod approval granted - proceeding to Terraform apply."
+
   root-apply:
     name: "Root Stage: Init, Validate, Plan, Apply (main)"
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: infra-approval
     runs-on: ubuntu-latest
     # APPLY identity: Contributor + Role Based Access Control Administrator
     # + Storage Blob Data Contributor. Only reachable from main, after a PR

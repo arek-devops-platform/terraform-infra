@@ -4,9 +4,25 @@ on:
   pull_request:
     branches:
       - main
+    # Scoped to the root and kubernetes/ Azure stages only. github/ has its
+    # own workflow (github-terraform.yml) and its own state - excluded here
+    # by simply not listing it, not by negation, since `*.tf` never matches
+    # into a subdirectory (only `**` does).
+    paths:
+      - "*.tf"
+      - "*.tfvars.example"
+      - ".terraform.lock.hcl"
+      - "kubernetes/**"
+      - ".github/workflows/terraform.yml"
   push:
     branches:
       - main
+    paths:
+      - "*.tf"
+      - "*.tfvars.example"
+      - ".terraform.lock.hcl"
+      - "kubernetes/**"
+      - ".github/workflows/terraform.yml"
 
 # Minimum permissions needed: read the repo checkout, and mint the OIDC
 # token that azure/login and Terraform's azurerm provider both exchange

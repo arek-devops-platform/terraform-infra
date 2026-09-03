@@ -1,0 +1,240 @@
+name: GitHub Terraform - Platform Configuration
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "github/**"
+      - ".github/workflows/github-terraform.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "github/**"
+      - ".github/workflows/github-terraform.yml"
+  workflow_dispatch: {}
+
+# No workflow-level permissions block on purpose - each job below declares
+# exactly what it needs, and nothing else. See the azurerm-side
+# terraform.yml for the same pattern.
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Pull request: plan only, using the read-only PLAN identity for both
+  # Azure (remote state) and GitHub (reading the live org configuration).
+  # ---------------------------------------------------------------------
+  plan-pr:
+    name: "GitHub Terraform: Plan"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: github
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Consumed by the Terraform azurerm backend (state read), not by
+      # azure/login - that action logs in the Azure CLI separately.
+      ARM_CLIENT_ID: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+      # This is NOT the workflow's automatic secrets.GITHUB_TOKEN - it is
+      # our own dedicated, narrowly-scoped PAT, exposed under the env var
+      # name the `integrations/github` provider looks for. Never echoed or
+      # logged anywhere in this job.
+      GITHUB_TOKEN: ${{ secrets.GH_TERRAFORM_PLAN_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, PLAN identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform fmt check
+        run: terraform fmt -check
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=github.tfstate"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # -lock=false: same reasoning as the azurerm-side pipeline - the
+      # PLAN identity only has Storage Blob Data Reader on the state
+      # storage account and cannot take the write-type blob lease that
+      # locking requires. It can never write state, so skipping the lock
+      # trades a tiny, harmless race for an identity with zero write
+      # capability anywhere in Azure.
+      - name: Terraform plan
+        run: terraform plan -input=false -lock=false
+
+  # ---------------------------------------------------------------------
+  # Push to main: plan again (never trust a PR's earlier plan blindly),
+  # save the exact plan to a file, and hand it off as an artifact - this
+  # is what lets the apply job below use a *different*, more privileged
+  # identity without ever recomputing what it's about to do.
+  # ---------------------------------------------------------------------
+  plan-main:
+    name: "GitHub Terraform: Plan Main"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: github
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Still the PLAN identity - planning never needs write access on
+      # either side (Azure state or the GitHub API), so it never gets it.
+      ARM_CLIENT_ID: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+      GITHUB_TOKEN: ${{ secrets.GH_TERRAFORM_PLAN_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, PLAN identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=github.tfstate"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # -out writes a local file on this runner's disk - that's unrelated
+      # to the Azure state lock, so it works fine even with -lock=false.
+      - name: Terraform plan (save to file)
+        run: terraform plan -input=false -lock=false -out=github.tfplan
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: github-tfplan
+          path: github/github.tfplan
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  # The approval gate itself. Deliberately does nothing else: no Azure
+  # login, no Terraform, no id-token. Its only job is to exist as a
+  # separate job carrying `environment: infra-prod`, so GitHub pauses it
+  # for the required reviewer - the apply job after it never touches this
+  # Environment directly, which is what keeps the APPLY identity's OIDC
+  # subject unchanged (see the note on the apply job below).
+  # ---------------------------------------------------------------------
+  manual-approval:
+    name: "Manual Approval Gate"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan-main
+    runs-on: ubuntu-latest
+    environment: infra-prod
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm approval
+        run: echo "infra-prod approval granted - proceeding to GitHub Terraform apply."
+
+  # ---------------------------------------------------------------------
+  # Applies exactly the plan file produced and uploaded above - never
+  # recomputes it, never re-plans. Uses the APPLY identity, which is the
+  # only one of the two with write access to both the state storage
+  # account and (via GH_TERRAFORM_APPLY_TOKEN) the GitHub organization.
+  # ---------------------------------------------------------------------
+  apply:
+    name: "GitHub Terraform: Apply"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: manual-approval
+    runs-on: ubuntu-latest
+    # Deliberately NOT set to `environment: infra-prod` here. Doing so
+    # would change this job's OIDC subject from
+    # repo:<org>/terraform-infra:ref:refs/heads/main to
+    # repo:<org>/terraform-infra:environment:infra-prod - a different
+    # subject than the one AZURE_APPLY_CLIENT_ID's existing federated
+    # credential trusts. The approval already happened in the job above;
+    # this job only needs to run after it, not carry the Environment
+    # itself.
+    defaults:
+      run:
+        working-directory: github
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+      # A separate, more privileged PAT than the plan jobs use - this is
+      # the credential that actually creates/modifies GitHub resources.
+      # Not the workflow's automatic secrets.GITHUB_TOKEN, and never
+      # echoed or logged anywhere in this job.
+      GITHUB_TOKEN: ${{ secrets.GH_TERRAFORM_APPLY_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Azure login (OIDC, APPLY identity - no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=github.tfstate"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: github-tfplan
+          path: github
+
+      # Applies exactly the plan approved above - never re-plans, never
+      # recomputes. Uses the write-capable APPLY identity on both sides
+      # (Azure state lock + GitHub API), unlike the plan jobs above.
+      - name: Terraform apply (exact saved plan)
+        run: terraform apply -input=false -auto-approve github.tfplan
